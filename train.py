@@ -141,7 +141,7 @@ def evaluate(G, D, config, data_loader, device, writer, global_step, prefix="eva
         disc_fake = D(ref, fake, condition)
         disc_real = D(ref, target, condition)
 
-        _, g_gan = GANLoss("hinge")(disc_fake)
+        _, g_gan = GANLoss("hinge")(disc_real, disc_fake)
         l1 = nn.L1Loss()(fake, target)
 
         l1_losses.append(l1.item())
