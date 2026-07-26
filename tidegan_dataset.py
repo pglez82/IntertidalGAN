@@ -83,7 +83,7 @@ class TideImageEntry:
 # ── Dataset ────────────────────────────────────────────────────────────────
 class TideGANDataset(Dataset):
     def __init__(self, sites=None, patch_size=256, augment=True,
-                 min_tide_diff=0.2, max_cloud_pct=0.01, max_nodata_pct=0.20, seed=42):
+                 min_tide_diff=0.2, max_cloud_pct=0.01, max_nodata_pct=0.10, seed=42):
         self.patch_size = patch_size
         self.augment = augment
         self.min_tide_diff = min_tide_diff
@@ -143,43 +143,53 @@ class TideGANDataset(Dataset):
             img = np.clip(img + offset, 0, 255)
         return img
 
-    def _get_valid_crop_coords(self, scl: np.ndarray, max_retries=50):
+    def _get_valid_crop_coords(self, ref_scl: np.ndarray, target_scl: np.ndarray, max_retries=50):
         """
-        Searches for random (y, x) coordinates where the SCL patch:
-        1. Has less than 'max_nodata_pct' black pixels (No Data).
-        2. Has less than 'max_cloud_pct' cloud/error pixels.
-        3. Contains both water and land (coastal dynamics).
+        Returns: (y, x, success_boolean, min_bad_ratio)
         """
-        H, W = scl.shape
-        
+        H, W = target_scl.shape
         if H <= self.patch_size or W <= self.patch_size:
-            return 0, 0
+            return 0, 0, False, float('inf')
+
+        best_y, best_x = 0, 0
+        min_bad_ratio = float('inf')
 
         for _ in range(max_retries):
             y1 = random.randint(0, H - self.patch_size)
             x1 = random.randint(0, W - self.patch_size)
             
-            patch_scl = scl[y1:y1+self.patch_size, x1:x1+self.patch_size]
+            patch_target = target_scl[y1:y1+self.patch_size, x1:x1+self.patch_size]
+            patch_ref = ref_scl[y1:y1+self.patch_size, x1:x1+self.patch_size]
             
-            # 1. Check No Data (Black pixels) threshold
-            nodata_ratio = np.mean(patch_scl == self.nodata_class)
-            if nodata_ratio > self.max_nodata_pct:
+            # Calculate ratio of invalid pixels in BOTH images
+            nodata_target = np.mean(patch_target == self.nodata_class)
+            nodata_ref = np.mean(patch_ref == self.nodata_class)
+            cloud_target = np.mean(np.isin(patch_target, self.cloud_classes))
+            cloud_ref = np.mean(np.isin(patch_ref, self.cloud_classes))
+            
+            # Total bad ratio (lower is better)
+            total_bad = nodata_target + nodata_ref + cloud_target + cloud_ref
+            
+            # Keep track of the best patch we've seen so far
+            if total_bad < min_bad_ratio:
+                min_bad_ratio = total_bad
+                best_y, best_x = y1, x1
+                
+            # Reject if thresholds exceeded
+            if nodata_target > self.max_nodata_pct or nodata_ref > self.max_nodata_pct:
+                continue
+            if cloud_target > self.max_cloud_pct or cloud_ref > self.max_cloud_pct:
                 continue
                 
-            # 2. Check Clouds/Errors threshold
-            cloud_ratio = np.mean(np.isin(patch_scl, self.cloud_classes))
-            if cloud_ratio > self.max_cloud_pct:
-                continue
-                
-            # 3. Check for Water (6) and Land/Vegetation (2, 4, 5, 7)
-            has_water = np.any(patch_scl == 6)
-            has_land = np.any(np.isin(patch_scl, [2, 4, 5, 7]))
+            # Check for coastal dynamic elements
+            has_water = np.any(patch_target == 6)
+            has_land = np.any(np.isin(patch_target, [2, 4, 5, 7]))
             
             if has_water and has_land:
-                return y1, x1
-                
-        # Fallback if no perfect patch is found after max_retries
-        return random.randint(0, H - self.patch_size), random.randint(0, W - self.patch_size)
+                return y1, x1, True, total_bad # Found a perfect patch!
+            
+        # Exhausted spatial retries, return the least bad one we found
+        return best_y, best_x, False, min_bad_ratio
 
     def _extract_and_pad(self, img: np.ndarray, y: int, x: int) -> np.ndarray:
         """Recorta la imagen. Si es más pequeña que el parche, aplica padding."""
@@ -208,37 +218,59 @@ class TideGANDataset(Dataset):
         site = random.choice(self.sites_list)
         entries = self.entries_by_site[site]
 
-        # Seleccionar Referencia y Target asegurando una diferencia mínima de marea
-        ref_entry = random.choice(self.ref_candidates[site])
-        for _ in range(20):
-            target_entry = random.choice(entries)
-            # Como ambos usan la misma escala global, la diferencia sigue siendo válida
-            if abs(target_entry.norm_tide - ref_entry.norm_tide) > self.min_tide_diff:
+        best_overall_bad_ratio = float('inf')
+        best_ref_entry = None
+        best_target_entry = None
+        best_y, best_x = 0, 0
+
+        # Try a maximum of 5 different image pairs (NO infinite loops)
+        for _ in range(5):
+            ref_entry = random.choice(self.ref_candidates[site])
+            
+            # Pick a target with sufficient tide difference
+            for _ in range(20):
+                target_entry = random.choice(entries)
+                if abs(target_entry.norm_tide - ref_entry.norm_tide) > self.min_tide_diff:
+                    break
+                    
+            # Load only the masks to keep it fast
+            ref_scl = _load_scl(ref_entry.scl_path)
+            target_scl = _load_scl(target_entry.scl_path)
+
+            y, x, success, bad_ratio = self._get_valid_crop_coords(ref_scl, target_scl)
+
+            # If it's perfect, stop searching completely
+            if success:
+                best_ref_entry = ref_entry
+                best_target_entry = target_entry
+                best_y, best_x = y, x
                 break
+                
+            # If it's not perfect, save it if it's the best one we've seen so far
+            if bad_ratio < best_overall_bad_ratio:
+                best_overall_bad_ratio = bad_ratio
+                best_ref_entry = ref_entry
+                best_target_entry = target_entry
+                best_y, best_x = y, x
 
-        # Cargar imágenes
-        ref_img = _load_image(ref_entry.rgb_path)
-        target_img = _load_image(target_entry.rgb_path)
-        target_scl = _load_scl(target_entry.scl_path)
+        # Load the heavy RGB images ONLY for the winning pair
+        ref_img = _load_image(best_ref_entry.rgb_path)
+        target_img = _load_image(best_target_entry.rgb_path)
 
-        # Recorte y aumentos espaciales sincronizados
-        y, x = self._get_valid_crop_coords(target_scl)
-        ref_patch = self._extract_and_pad(ref_img, y, x)
-        target_patch = self._extract_and_pad(target_img, y, x)
+        # Crop using our winning coordinates
+        ref_patch = self._extract_and_pad(ref_img, best_y, best_x)
+        target_patch = self._extract_and_pad(target_img, best_y, best_x)
 
         if self.augment and random.random() > 0.5:
             ref_patch = np.ascontiguousarray(ref_patch[:, ::-1, :])
             target_patch = np.ascontiguousarray(target_patch[:, ::-1, :])
 
-        # Aumentos de color independientes
         if self.augment:
             ref_patch = self._color_jitter(ref_patch)
             target_patch = self._color_jitter(target_patch)
 
-        # Convertir a tensores
         ref_tensor = self._to_tensor(ref_patch)
         target_tensor = self._to_tensor(target_patch)
-
-        tide = torch.tensor([target_entry.norm_tide], dtype=torch.float32)
+        tide = torch.tensor([best_target_entry.norm_tide], dtype=torch.float32)
 
         return ref_tensor, target_tensor, tide
