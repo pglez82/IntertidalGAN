@@ -83,16 +83,13 @@ class TideImageEntry:
 # ── Dataset ────────────────────────────────────────────────────────────────
 class TideGANDataset(Dataset):
     def __init__(self, sites=None, patch_size=256, augment=True,
-                 min_tide_diff=0.2, max_cloud_pct=0.01, max_nodata_pct=0.10, seed=42):
+                 min_tide_diff=0.2, max_cloud_pct=0.01, max_nodata_pct=0.20, seed=42):
         self.patch_size = patch_size
         self.augment = augment
         self.min_tide_diff = min_tide_diff
-        
-        # New independent thresholds
         self.max_cloud_pct = max_cloud_pct
         self.max_nodata_pct = max_nodata_pct
         
-        # Class 0 is "No Data", the rest are actual clouds/sensor errors
         self.nodata_class = 0
         self.cloud_classes = [1, 3, 8, 9, 10]
         
@@ -102,12 +99,30 @@ class TideGANDataset(Dataset):
         if sites is None: sites = SITES
 
         self.entries_by_site = {}
+        all_tides = []  # Lista temporal para guardar todas las mareas absolutas
+
+        # 1. Cargar todos los datos y registrar las mareas
         for site in sites:
             csv_path = os.path.join(SITE_DIR, site, f"dataset_{site.lower()}.csv")
             rows = _read_csv(csv_path)
             entries = sorted([TideImageEntry(r, site) for r in rows], key=lambda e: e.tide)
             self.entries_by_site[site] = entries
+            
+            # Guardamos las mareas para calcular los extremos globales
+            all_tides.extend([e.tide for e in entries])
 
+        # 2. Calcular extremos globales
+        self.global_min_tide = min(all_tides)
+        self.global_max_tide = max(all_tides)
+        print(f"Dataset cargado. Rango de marea global: [{self.global_min_tide}m, {self.global_max_tide}m]")
+
+        # 3. Asignar la marea normalizada global a cada entrada
+        for site, entries in self.entries_by_site.items():
+            for entry in entries:
+                # Normalización Min-Max al rango [-1, 1]
+                entry.norm_tide = 2.0 * (entry.tide - self.global_min_tide) / (self.global_max_tide - self.global_min_tide) - 1.0
+
+        # Seleccionar candidatos de referencia (las mareas más bajas)
         self.ref_candidates = {}
         for site, entries in self.entries_by_site.items():
             n_ref = min(10, len(entries))
@@ -193,31 +208,29 @@ class TideGANDataset(Dataset):
         site = random.choice(self.sites_list)
         entries = self.entries_by_site[site]
 
-        # Seleccionar Referencia y Target
+        # Seleccionar Referencia y Target asegurando una diferencia mínima de marea
         ref_entry = random.choice(self.ref_candidates[site])
         for _ in range(20):
             target_entry = random.choice(entries)
+            # Como ambos usan la misma escala global, la diferencia sigue siendo válida
             if abs(target_entry.norm_tide - ref_entry.norm_tide) > self.min_tide_diff:
                 break
 
-        # Cargar RGB y SCL
+        # Cargar imágenes
         ref_img = _load_image(ref_entry.rgb_path)
         target_img = _load_image(target_entry.rgb_path)
-        target_scl = _load_scl(target_entry.scl_path) # Usamos la SCL del target para validar el parche
+        target_scl = _load_scl(target_entry.scl_path)
 
-        # 1. Buscar coordenadas válidas usando la SCL (Mismo recorte para ambos)
+        # Recorte y aumentos espaciales sincronizados
         y, x = self._get_valid_crop_coords(target_scl)
-
-        # 2. Extraer parches con las MISMAS coordenadas
         ref_patch = self._extract_and_pad(ref_img, y, x)
         target_patch = self._extract_and_pad(target_img, y, x)
 
-        # 3. Aumentos Geométricos Sincronizados (Mismo flip para ambos)
         if self.augment and random.random() > 0.5:
             ref_patch = np.ascontiguousarray(ref_patch[:, ::-1, :])
             target_patch = np.ascontiguousarray(target_patch[:, ::-1, :])
 
-        # 4. Aumentos de Color Independientes
+        # Aumentos de color independientes
         if self.augment:
             ref_patch = self._color_jitter(ref_patch)
             target_patch = self._color_jitter(target_patch)
@@ -226,9 +239,6 @@ class TideGANDataset(Dataset):
         ref_tensor = self._to_tensor(ref_patch)
         target_tensor = self._to_tensor(target_patch)
 
-        condition = torch.cat([
-            torch.tensor([target_entry.norm_tide]),
-            self._site_one_hot(site, len(self.sites_list))
-        ])
+        tide = torch.tensor([target_entry.norm_tide], dtype=torch.float32)
 
-        return ref_tensor, target_tensor, condition
+        return ref_tensor, target_tensor, tide
