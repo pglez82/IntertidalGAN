@@ -96,7 +96,8 @@ class TideGANDataset(Dataset):
         random.seed(seed)
         np.random.seed(seed)
 
-        if sites is None: sites = SITES
+        if sites is None: 
+            sites = SITES
 
         self.entries_by_site = {}
         all_tides = []  # Lista temporal para guardar todas las mareas absolutas
@@ -105,28 +106,45 @@ class TideGANDataset(Dataset):
         for site in sites:
             csv_path = os.path.join(SITE_DIR, site, f"dataset_{site.lower()}.csv")
             rows = _read_csv(csv_path)
+            # Ordenar las entradas de marea más baja a más alta
             entries = sorted([TideImageEntry(r, site) for r in rows], key=lambda e: e.tide)
             self.entries_by_site[site] = entries
             
-            # Guardamos las mareas para calcular los extremos globales
+            # Guardar las mareas para calcular los extremos globales
             all_tides.extend([e.tide for e in entries])
 
-        # 2. Calcular extremos globales
+        # 2. Calcular extremos globales y normalizar a [-1, 1]
         self.global_min_tide = min(all_tides)
         self.global_max_tide = max(all_tides)
         print(f"Dataset cargado. Rango de marea global: [{self.global_min_tide}m, {self.global_max_tide}m]")
 
-        # 3. Asignar la marea normalizada global a cada entrada
         for site, entries in self.entries_by_site.items():
             for entry in entries:
-                # Normalización Min-Max al rango [-1, 1]
                 entry.norm_tide = 2.0 * (entry.tide - self.global_min_tide) / (self.global_max_tide - self.global_min_tide) - 1.0
 
-        # Seleccionar candidatos de referencia (las mareas más bajas)
-        self.ref_candidates = {}
+        # 3. Buscar UNA única imagen de referencia perfecta por sitio
+        self.ref_image_by_site = {}
         for site, entries in self.entries_by_site.items():
-            n_ref = min(10, len(entries))
-            self.ref_candidates[site] = entries[:n_ref]
+            best_ref = None
+            
+            # Recorrer las imágenes empezando por la marea más baja
+            for entry in entries:
+                scl = _load_scl(entry.scl_path)
+                cloud_ratio = np.mean(np.isin(scl, self.cloud_classes))
+                nodata_ratio = np.mean(scl == self.nodata_class)
+                
+                # Tolerancia súper estricta para la referencia global de toda la imagen
+                if cloud_ratio <= 0.01 and nodata_ratio <= 0.05:
+                    best_ref = entry
+                    print(f"[{site}] Referencia fija: {entry.date} (Marea: {entry.tide}m, Nubes: {cloud_ratio:.1%})")
+                    break
+            
+            # Fallback de seguridad: si todas tienen nubes, cogemos la marea más baja
+            if best_ref is None:
+                print(f"[{site}] Aviso: No se encontró referencia sin nubes. Usando marea más baja por defecto.")
+                best_ref = entries[0]
+                
+            self.ref_image_by_site[site] = best_ref
 
         self.sites_list = list(self.entries_by_site.keys())
 
@@ -218,57 +236,60 @@ class TideGANDataset(Dataset):
         site = random.choice(self.sites_list)
         entries = self.entries_by_site[site]
 
+        # 1. Coger la referencia única y limpia de este sitio
+        ref_entry = self.ref_image_by_site[site]
+        # Cargamos la máscara de referencia fuera del bucle de intentos (optimización de I/O)
+        ref_scl = _load_scl(ref_entry.scl_path)
+
         best_overall_bad_ratio = float('inf')
-        best_ref_entry = None
         best_target_entry = None
         best_y, best_x = 0, 0
 
-        # Try a maximum of 5 different image pairs (NO infinite loops)
+        # Intentar un máximo de 5 pares diferentes para evitar bucles infinitos en zonas muy nubladas
         for _ in range(5):
-            ref_entry = random.choice(self.ref_candidates[site])
-            
-            # Pick a target with sufficient tide difference
+            # 2. Buscar un target con suficiente diferencia de marea
             for _ in range(20):
                 target_entry = random.choice(entries)
                 if abs(target_entry.norm_tide - ref_entry.norm_tide) > self.min_tide_diff:
                     break
                     
-            # Load only the masks to keep it fast
-            ref_scl = _load_scl(ref_entry.scl_path)
+            # 3. Cargar la máscara del target
             target_scl = _load_scl(target_entry.scl_path)
 
+            # 4. Buscar un recorte válido evaluando ambas máscaras juntas
             y, x, success, bad_ratio = self._get_valid_crop_coords(ref_scl, target_scl)
 
-            # If it's perfect, stop searching completely
+            # Si encontramos un parche perfecto (cumple todos los umbrales), paramos de buscar
             if success:
-                best_ref_entry = ref_entry
                 best_target_entry = target_entry
                 best_y, best_x = y, x
                 break
                 
-            # If it's not perfect, save it if it's the best one we've seen so far
+            # Si no es perfecto, lo guardamos por si es el "menos malo" que hemos visto
             if bad_ratio < best_overall_bad_ratio:
                 best_overall_bad_ratio = bad_ratio
-                best_ref_entry = ref_entry
                 best_target_entry = target_entry
                 best_y, best_x = y, x
 
-        # Load the heavy RGB images ONLY for the winning pair
-        ref_img = _load_image(best_ref_entry.rgb_path)
+        # 5. Cargar las imágenes RGB pesadas SOLO para el par ganador final
+        ref_img = _load_image(ref_entry.rgb_path)
         target_img = _load_image(best_target_entry.rgb_path)
 
-        # Crop using our winning coordinates
+        # 6. Recortar y aplicar padding usando nuestras coordenadas ganadoras
         ref_patch = self._extract_and_pad(ref_img, best_y, best_x)
         target_patch = self._extract_and_pad(target_img, best_y, best_x)
 
+        # 7. Aumentos espaciales sincronizados (flip horizontal)
         if self.augment and random.random() > 0.5:
             ref_patch = np.ascontiguousarray(ref_patch[:, ::-1, :])
             target_patch = np.ascontiguousarray(target_patch[:, ::-1, :])
 
+        # 8. Aumentos de color independientes
         if self.augment:
             ref_patch = self._color_jitter(ref_patch)
             target_patch = self._color_jitter(target_patch)
 
+        # 9. Convertir a tensores PyTorch
         ref_tensor = self._to_tensor(ref_patch)
         target_tensor = self._to_tensor(target_patch)
         tide = torch.tensor([best_target_entry.norm_tide], dtype=torch.float32)
