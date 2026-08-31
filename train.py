@@ -1,15 +1,16 @@
 """
-TideGAN Training Loop
+Tide-conditioned image translation training loop.
 
-End-to-end training script for the conditional GAN.
+This project learns to generate the target coastal image from a reference image
+and a tide condition, using a supervised L1 objective instead of adversarial
+training.
 
 Usage:
-    python train.py [--epochs 100] [--batch_size 8] [--lr 2e-4] [--patch_size 256]
-                   [--site foz] [--save_dir checkpoints] [--resume checkpoint.pth]
+    python train.py [--epochs 100] [--batch_size 8] [--lr_g 1e-4] [--patch_size 256]
+                   [--site foz] [--save_dir checkpoints/tidegan] [--resume checkpoint.pth]
 
 Features:
-    - Adaptive training: alternate G and D updates with ratio 1:1
-    - Gradient penalty for improved stability (WGAN-GP style)
+    - Conditional image-to-image translation from reference + tide
     - L1 reconstruction loss for content consistency
     - Per-site evaluation and visualization
     - TensorBoard logging
@@ -30,7 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from tidegan_dataset import TideGANDataset, SITES, SITE_TIDE_RANGES, SITE_DIR
-from tidegan_model import Generator, Discriminator, GANLoss, count_parameters
+from tidegan_model import Generator, count_parameters
 from PIL import Image
 import random
 
@@ -42,7 +43,6 @@ def get_config(args):
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr_g": args.lr_g,
-        "lr_d": args.lr_d,
         "patch_size": args.patch_size,
         "site": args.site,
         # Conditions always use the stable global site vocabulary.  A subset
@@ -51,10 +51,7 @@ def get_config(args):
         "cond_dim": 16,
         "beta1": 0.5,
         "beta2": 0.9,
-        "gradient_penalty": 0.0,
         "l1_weight": 5.0,
-        "gan_weight": 0.1,
-        "pretrain_epochs": args.pretrain_epochs,
         "log_interval": 25,
         "save_interval": 10,
         "eval_interval": 2,
@@ -107,154 +104,83 @@ def save_generated_samples(G, val_loader, save_dir, epoch, device):
     G.eval()
     os.makedirs(save_dir, exist_ok=True)
 
-    for i, batch in enumerate(val_loader):
+    for batch in val_loader:
         ref, target, condition = batch
         ref = ref.to(device)
         target = target.to(device)
         condition = condition.to(device)
 
         fake = G(ref, condition)
+        sample_idx = 0
 
-        for j in range(min(3, ref.size(0))):
-            ref_img = ((ref[j].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
-            fake_img = ((fake[j].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
-            tgt_img = ((target[j].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
+        ref_img = ((ref[sample_idx].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
+        fake_img = ((fake[sample_idx].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
+        tgt_img = ((target[sample_idx].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
 
-            ref_pil = Image.fromarray((ref_img * 255).astype(np.uint8))
-            fake_pil = Image.fromarray((fake_img * 255).astype(np.uint8))
-            tgt_pil = Image.fromarray((tgt_img * 255).astype(np.uint8))
+        panel_ref = Image.fromarray((ref_img * 255).astype(np.uint8))
+        panel_fake = Image.fromarray((fake_img * 255).astype(np.uint8))
+        panel_target = Image.fromarray((tgt_img * 255).astype(np.uint8))
 
-            ref_pil.save(os.path.join(save_dir, f"epoch_{epoch}_ref_{j}.png"))
-            fake_pil.save(os.path.join(save_dir, f"epoch_{epoch}_fake_{j}.png"))
-            tgt_pil.save(os.path.join(save_dir, f"epoch_{epoch}_target_{j}.png"))
-
+        montage = Image.new(
+            "RGB",
+            (panel_ref.width * 3, panel_ref.height),
+            color=(255, 255, 255),
+        )
+        montage.paste(panel_ref, (0, 0))
+        montage.paste(panel_fake, (panel_ref.width, 0))
+        montage.paste(panel_target, (panel_ref.width * 2, 0))
+        montage.save(os.path.join(save_dir, f"epoch_{epoch}_comparison.png"))
         break
 
     G.train()
 
 # ── Training functions ────────────────────────────────────────────────────
-def train_step_g(G, D, optimizer_g, criterion, config, batch, device):
-    """Single generator update step."""
-    ref, target, condition = batch
-    ref = ref.to(device)
-    target = target.to(device)
-    condition = condition.to(device)
-
-    # Generate fake image
-    fake = G(ref, condition)
-
-    # Discriminator output on fake
-    disc_fake = D(ref, fake, condition)
-
-    # Generator loss: GAN + L1
-    _, g_gan_loss = criterion(None, disc_fake)
-    g_l1_loss = nn.L1Loss()(fake, target)
-    g_loss = g_gan_loss + config["l1_weight"] * g_l1_loss
-
-    optimizer_g.zero_grad()
-    g_loss.backward()
-    optimizer_g.step()
-
-    return g_loss.item(), g_gan_loss.item(), g_l1_loss.item(), fake
-
-
-def train_step_d(G, D, optimizer_d, criterion, config, ref, target, condition, fake, device):
-    """Single discriminator update step with gradient penalty."""
-    ref = ref.to(device)
-    target = target.to(device)
-    condition = condition.to(device)
-
-    # Real
-    disc_real = D(ref, target, condition)
-    # Fake (detach generator to not backprop through it)
-    with torch.no_grad():
-        fake_detached = fake.detach()
-    disc_fake = D(ref, fake_detached, condition)
-
-    # Hinge D loss
-    d_gan_loss, _ = criterion(disc_real, disc_fake)
-
-    # Gradient penalty (WGAN-GP style)
-    alpha = torch.rand(ref.size(0), 1, 1, 1, device=device)
-    interpolates = alpha * target + (1 - alpha) * fake_detached
-    interpolates.requires_grad_(True)
-    disc_interp = D(ref, interpolates, condition)
-    gradients = torch.autograd.grad(
-        outputs=disc_interp.sum(),
-        inputs=interpolates,
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True,
-    )[0]
-    grad_norm = gradients.norm(2, dim=1)
-    gp = config["gradient_penalty"] * ((grad_norm - 1.0) ** 2).mean()
-
-    d_loss = d_gan_loss + gp
-
-    optimizer_d.zero_grad()
-    d_loss.backward()
-    optimizer_d.step()
-
-    return d_loss.item(), d_gan_loss.item(), gp.item()
-
-
 @torch.no_grad()
-def evaluate(G, D, config, data_loader, device, writer, global_step, prefix="eval"):
-    """Run a quick evaluation epoch."""
+def evaluate(G, data_loader, device, writer, global_step, prefix="eval"):
+    """Run a quick evaluation epoch using supervised L1 loss only."""
     G.eval()
-    D.eval()
 
     l1_losses = []
-    gan_losses = []
 
     for batch in data_loader:
         ref, target, condition = batch
         ref, target, condition = ref.to(device), target.to(device), condition.to(device)
 
         fake = G(ref, condition)
-        disc_fake = D(ref, fake, condition)
-        disc_real = D(ref, target, condition)
-
-        _, g_gan = GANLoss("hinge")(disc_real, disc_fake)
         l1 = nn.L1Loss()(fake, target)
-
         l1_losses.append(l1.item())
-        gan_losses.append(g_gan.item())
 
     G.train()
-    D.train()
 
     mean_l1 = np.mean(l1_losses) if l1_losses else 0
-    mean_gan = np.mean(gan_losses) if gan_losses else 0
 
     if writer is not None:
         writer.add_scalar(f"{prefix}/l1", mean_l1, global_step)
-        writer.add_scalar(f"{prefix}/gan", mean_gan, global_step)
-        writer.add_image(f"{prefix}/reference", (ref[0].cpu().permute(1, 2, 0).clamp(-1, 1).numpy() + 1) / 2,
-                         global_step, dataformats="HWC")
-        writer.add_image(f"{prefix}/generated", (fake[0].cpu().permute(1, 2, 0).clamp(-1, 1).numpy() + 1) / 2,
-                         global_step, dataformats="HWC")
-        writer.add_image(f"{prefix}/target", (target[0].cpu().permute(1, 2, 0).clamp(-1, 1).numpy() + 1) / 2,
-                         global_step, dataformats="HWC")
+        writer.add_image(
+            f"{prefix}/comparison",
+            (np.concatenate([
+                ((ref[0].cpu().permute(1, 2, 0).clamp(-1, 1).numpy() + 1) / 2),
+                ((fake[0].cpu().permute(1, 2, 0).clamp(-1, 1).numpy() + 1) / 2),
+                ((target[0].cpu().permute(1, 2, 0).clamp(-1, 1).numpy() + 1) / 2),
+            ], axis=1) * 255).astype(np.uint8),
+            global_step,
+            dataformats="HWC",
+        )
 
-    return mean_l1, mean_gan
+    return mean_l1
 
 
 # ── Save / Load ───────────────────────────────────────────────────────────
-def save_checkpoint(config, G, D, optimizer_g, optimizer_d, epoch, global_step, path,
-                    data_rng=None):
-    """Save training state."""
+def save_checkpoint(config, G, optimizer_g, epoch, global_step, path, data_rng=None):
+    """Save generator-only training state."""
     G_state = G.module.state_dict() if hasattr(G, "module") else G.state_dict()
-    D_state = D.module.state_dict() if hasattr(D, "module") else D.state_dict()
 
     torch.save({
         "config": config,
         "epoch": epoch,
         "global_step": global_step,
         "generator_state": G_state,
-        "discriminator_state": D_state,
         "optimizer_g": optimizer_g.state_dict(),
-        "optimizer_d": optimizer_d.state_dict(),
         "python_rng_state": random.getstate(),
         "numpy_rng_state": np.random.get_state(),
         "torch_rng_state": torch.get_rng_state(),
@@ -264,9 +190,8 @@ def save_checkpoint(config, G, D, optimizer_g, optimizer_d, epoch, global_step, 
     print(f"  ✓ Checkpoint saved: {path}")
 
 
-def load_checkpoint(path, G, D=None, optimizer_g=None, optimizer_d=None, device="cpu",
-                    data_rng=None):
-    """Load training state."""
+def load_checkpoint(path, G, optimizer_g=None, device="cpu", data_rng=None):
+    """Load generator-only training state."""
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
     G_state = checkpoint["generator_state"]
@@ -275,17 +200,8 @@ def load_checkpoint(path, G, D=None, optimizer_g=None, optimizer_d=None, device=
     else:
         G.load_state_dict(G_state)
 
-    if D is not None:
-        D_state = checkpoint["discriminator_state"]
-        if hasattr(D, "module"):
-            D.module.load_state_dict(D_state)
-        else:
-            D.load_state_dict(D_state)
-
     if optimizer_g is not None and "optimizer_g" in checkpoint:
         optimizer_g.load_state_dict(checkpoint["optimizer_g"])
-    if optimizer_d is not None and "optimizer_d" in checkpoint:
-        optimizer_d.load_state_dict(checkpoint["optimizer_d"])
     if "python_rng_state" in checkpoint:
         random.setstate(checkpoint["python_rng_state"])
         np.random.set_state(checkpoint["numpy_rng_state"])
@@ -295,7 +211,6 @@ def load_checkpoint(path, G, D=None, optimizer_g=None, optimizer_d=None, device=
     if data_rng is not None and checkpoint.get("data_rng_state") is not None:
         data_rng.set_state(checkpoint["data_rng_state"])
     print(f"  ✓ Loaded checkpoint from epoch {checkpoint['epoch']}, step {checkpoint['global_step']}")
-    # Checkpoints store the one-based epoch that has just completed.
     return checkpoint.get("epoch", 0), checkpoint.get("global_step", 0)
 
 
@@ -358,22 +273,15 @@ def train(args):
 
     # ── Models ──────────────────────────────────────────────────────────
     G = Generator(n_sites=config["n_sites"], cond_dim=config["cond_dim"]).to(device)
-    D = Discriminator(n_sites=config["n_sites"], cond_dim=config["cond_dim"]).to(device)
 
     if len(device_ids) > 1:
         G = nn.DataParallel(G, device_ids=device_ids)
-        D = nn.DataParallel(D, device_ids=device_ids)
 
     print(f"\nGenerator parameters: {count_parameters(G):,}")
-    print(f"Discriminator parameters: {count_parameters(D):,}")
 
-    # ── Optimizers & Loss ───────────────────────────────────────────────
+    # ── Optimizer ──────────────────────────────────────────────────────
     optimizer_g = optim.Adam(G.parameters(), lr=config["lr_g"],
                              betas=(config["beta1"], config["beta2"]))
-    optimizer_d = optim.Adam(D.parameters(), lr=config["lr_d"],
-                             betas=(config["beta1"], config["beta2"]))
-
-    criterion = GANLoss("hinge")
 
     # ── Logging ─────────────────────────────────────────────────────────
     save_dir = args.save_dir
@@ -385,7 +293,7 @@ def train(args):
 
     if args.resume:
         start_epoch, global_step = load_checkpoint(
-            args.resume, G, D, optimizer_g, optimizer_d, device, data_rng)
+            args.resume, G, optimizer_g, device, data_rng)
 
     # ── Training ────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -393,15 +301,11 @@ def train(args):
           f"batch_size={config['batch_size']}, patch_size={config['patch_size']}")
     print(f"{'='*60}\n")
 
-    D.train()
-
     for epoch in range(start_epoch, config["epochs"]):
         epoch_start = time.time()
-        running_d_loss = 0
-        running_g_loss = 0
+        running_g_loss = 0.0
         n_batches = 0
 
-        # Progress bar
         pbar = tqdm(data_loader, desc=f"Epoch {epoch+1}/{config['epochs']}",
                     disable=args.no_progress_bar)
 
@@ -409,84 +313,41 @@ def train(args):
             ref, target, condition = batch
             ref, target, condition = ref.to(device), target.to(device), condition.to(device)
 
-            if epoch < config["pretrain_epochs"]:
-                optimizer_g.zero_grad()
-                fake = G(ref, condition)
-                g_l1_loss = nn.L1Loss()(fake, target)
-                g_l1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=5.0)
-                optimizer_g.step()
-                g_loss = float(g_l1_loss.item())
-                d_loss = 0.0
-                gp = 0.0
-                g_gan_loss = 0.0
-                d_gan_loss = 0.0
-            else:
-                # ── Update Generator ──────────────────────────────────────
-                optimizer_g.zero_grad()
-                fake = G(ref, condition)
-                disc_fake = D(ref, fake, condition)
-                g_gan_loss = F.binary_cross_entropy_with_logits(disc_fake, torch.ones_like(disc_fake))
-                g_l1_loss = nn.L1Loss()(fake, target)
-                g_loss = config["gan_weight"] * g_gan_loss + config["l1_weight"] * g_l1_loss
-                g_loss.backward()
-                torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=5.0)
-                optimizer_g.step()
+            optimizer_g.zero_grad()
+            fake = G(ref, condition)
+            g_l1_loss = nn.L1Loss()(fake, target)
+            g_loss = config["l1_weight"] * g_l1_loss
+            g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=5.0)
+            optimizer_g.step()
 
-                # ── Update Discriminator ──────────────────────────────────
-                optimizer_d.zero_grad()
-                disc_real = D(ref, target, condition)
-                disc_fake = D(ref, fake.detach(), condition)
-                d_real = F.binary_cross_entropy_with_logits(disc_real, torch.ones_like(disc_real))
-                d_fake = F.binary_cross_entropy_with_logits(disc_fake, torch.zeros_like(disc_fake))
-                d_loss = (d_real + d_fake) / 2.0
-                d_loss.backward()
-                torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=5.0)
-                optimizer_d.step()
-
-                gp = 0.0
-                d_gan_loss = float(d_loss.item())
-
-            # Logging
-            running_d_loss += float(d_loss)
-            running_g_loss += float(g_loss)
+            running_g_loss += float(g_loss.item())
             n_batches += 1
 
             if global_step % config["log_interval"] == 0:
-                writer.add_scalar("loss/g_gan", float(g_gan_loss), global_step)
-                writer.add_scalar("loss/g_l1", float(g_l1_loss), global_step)
-                writer.add_scalar("loss/d_gan", float(d_gan_loss), global_step)
-                writer.add_scalar("loss/gp", float(gp), global_step)
+                writer.add_scalar("loss/g_l1", float(g_l1_loss.item()), global_step)
                 writer.add_scalar("lr/g", optimizer_g.param_groups[0]["lr"], global_step)
-                writer.add_scalar("lr/d", optimizer_d.param_groups[0]["lr"], global_step)
 
             global_step += 1
 
-        # Epoch metrics
-        avg_d = running_d_loss / n_batches
         avg_g = running_g_loss / n_batches
         epoch_time = time.time() - epoch_start
 
-        writer.add_scalar("metrics/d_loss", avg_d, epoch)
         writer.add_scalar("metrics/g_loss", avg_g, epoch)
 
         print(f"\nEpoch {epoch+1}/{config['epochs']}  "
-              f"D={avg_d:.4f}  G={avg_g:.4f}  "
+              f"G={avg_g:.4f}  "
               f"L1={g_l1_loss.item():.4f}  "
               f"Time: {epoch_time:.1f}s")
 
-        # ── Evaluation ──────────────────────────────────────────────
         if (epoch + 1) % config["eval_interval"] == 0 or epoch == 0:
             print(f"  Running evaluation...")
-            eval_l1, eval_gan = evaluate(
-                G, D, config, val_loader, device, writer, epoch, "eval")
-            print(f"  Eval L1: {eval_l1:.4f}  Eval GAN: {eval_gan:.4f}")
+            eval_l1 = evaluate(G, val_loader, device, writer, epoch, "eval")
+            print(f"  Eval L1: {eval_l1:.4f}")
 
-        # ── Save checkpoint ─────────────────────────────────────────
         if (epoch + 1) % config["save_interval"] == 0 or epoch == 0:
             ckpt_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth")
-            save_checkpoint(config, G, D, optimizer_g, optimizer_d,
-                            epoch + 1, global_step, ckpt_path, data_rng)
+            save_checkpoint(config, G, optimizer_g, epoch + 1, global_step, ckpt_path, data_rng)
 
         save_generated_samples(G, val_loader, os.path.join(save_dir, "samples"), epoch, device)
 
@@ -559,15 +420,12 @@ def main():
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr_g", type=float, default=1e-4)
-    parser.add_argument("--lr_d", type=float, default=2e-4)
     parser.add_argument("--patch_size", type=int, default=256)
     parser.add_argument("--site", nargs="+", default=None, help="Sites to use (e.g. Foz Santander Villaviciosa, default: all)")
     parser.add_argument("--save_dir", type=str, default="checkpoints/tidegan")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--pretrain_epochs", type=int, default=15,
-                        help="Warm-up epochs with L1-only supervision before adversarial training starts")
     parser.add_argument("--devices", type=int, nargs="+", default=None,
                         help="CUDA device ids to use for training, e.g. --devices 0 1")
     parser.add_argument("--no_progress_bar", action="store_true")
