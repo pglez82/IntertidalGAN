@@ -165,7 +165,7 @@ class TideGANDataset(Dataset):
         self.sites_list = list(self.entries_by_site.keys())
 
     def __len__(self):
-        return 100000
+        return 10000
 
     def _color_jitter_pair(self, ref: np.ndarray, target: np.ndarray):
         """Aplica el mismo aumento fotométrico a las dos imágenes del par."""
