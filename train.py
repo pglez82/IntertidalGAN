@@ -55,7 +55,7 @@ def get_config(args):
         "l1_weight": 100.0,
         "log_interval": 50,
         "save_interval": 5,
-        "eval_interval": 20,
+        "eval_interval": 1,
         "num_workers": args.num_workers,
         "seed": args.seed,
     }
@@ -245,10 +245,14 @@ def train(args):
 
     # ── Data ────────────────────────────────────────────────────────────
     print(f"\nLoading data (sites: {config['n_sites']})...")
+    train_sites = config["site"] if config["site"] else SITES
     dataset = TideGANDataset(
-        sites=config["site"] if config["site"] else SITES,
+        sites=train_sites,
         patch_size=config["patch_size"],
         augment=True,
+        split="train",
+        split_mode="image",
+        val_ratio=0.2,
         seed=config["seed"],
     )
     data_rng = torch.Generator().manual_seed(config["seed"])
@@ -263,12 +267,15 @@ def train(args):
         generator=data_rng,
     )
 
-    # Validation set (small, no augmentation)
+    # Validation set: same site pool, but disjoint by image/tide split to avoid leakage.
     val_dataset = TideGANDataset(
-        sites=config["site"] if config["site"] else SITES,
+        sites=train_sites,
         patch_size=config["patch_size"],
         augment=False,
-        seed=123,
+        split="val",
+        split_mode="image",
+        val_ratio=0.2,
+        seed=config["seed"],
     )
     val_loader = DataLoader(
         val_dataset,
@@ -473,7 +480,7 @@ def main():
     parser = argparse.ArgumentParser(description="TideGAN: Conditional GAN for tide-aware coastal image generation")
     parser.add_argument("--mode", choices=["train", "generate"], default="train")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr_g", type=float, default=2e-4)
     parser.add_argument("--lr_d", type=float, default=2e-4)
     parser.add_argument("--patch_size", type=int, default=256)

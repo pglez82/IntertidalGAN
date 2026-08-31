@@ -98,20 +98,25 @@ class TideImageEntry:
 # ── Dataset ────────────────────────────────────────────────────────────────
 class TideGANDataset(Dataset):
     def __init__(self, sites=None, patch_size=256, augment=True,
-                 min_tide_diff=0.2, max_cloud_pct=0.01, max_nodata_pct=0.10, seed=42):
+                 min_tide_diff=0.2, max_cloud_pct=0.01, max_nodata_pct=0.10,
+                 split=None, split_mode="image", val_ratio=0.2, seed=42):
         self.patch_size = patch_size
         self.augment = augment
         self.min_tide_diff = min_tide_diff
         self.max_cloud_pct = max_cloud_pct
         self.max_nodata_pct = max_nodata_pct
-        
+        self.split = split
+        self.split_mode = split_mode.lower() if split_mode is not None else None
+        self.val_ratio = float(val_ratio)
+        self.seed = seed
+
         self.nodata_class = 0
         self.cloud_classes = [1, 3, 8, 9, 10]
-        
+
         random.seed(seed)
         np.random.seed(seed)
 
-        if sites is None: 
+        if sites is None:
             sites = SITES
 
         self.entries_by_site = {}
@@ -122,11 +127,15 @@ class TideGANDataset(Dataset):
             csv_path = os.path.join(SITE_DIR, site, f"dataset_{site.lower()}.csv")
             rows = _read_csv(csv_path)
             entries = sorted([TideImageEntry(r, site) for r in rows], key=lambda e: e.tide)
+            entries = self._split_entries_for_site(entries, site)
             self.entries_by_site[site] = entries
             all_tides.extend([e.tide for e in entries])
 
         if not all_tides:
-            raise ValueError("No se encontraron imágenes con datos de marea.")
+            raise ValueError(
+                f"No se encontraron imágenes con datos de marea para el split solicitado "
+                f"(split={self.split}, mode={self.split_mode}, val_ratio={self.val_ratio})."
+            )
 
         # 2. Normalización global de mareas
         self.global_min_tide = min(all_tides)
@@ -150,22 +159,59 @@ class TideGANDataset(Dataset):
             for entry in entries:
                 scl = entry.scl_data
                 cloud_ratio = np.mean(np.isin(scl, self.cloud_classes))
-                
+
                 if cloud_ratio <= self.max_cloud_pct:
                     best_ref = entry
                     print(f"[{site}] Referencia fija: {entry.date} (Marea: {entry.tide}m, Nubes: {cloud_ratio:.1%})")
                     break
-            
+
             if best_ref is None:
                 print(f"[{site}] Aviso: No se encontró referencia sin nubes. Usando marea más baja.")
                 best_ref = entries[0]
-                
+
             self.ref_image_by_site[site] = best_ref
 
         self.sites_list = list(self.entries_by_site.keys())
 
+    def _split_entries_for_site(self, entries, site):
+        """Split image-level data deterministically by tide values to avoid train/val leakage."""
+        if self.split is None:
+            return list(entries)
+
+        if self.split_mode not in (None, "image"):
+            raise ValueError(f"split_mode={self.split_mode!r} no está soportado. Usa 'image'.")
+
+        if len(entries) <= 1:
+            return list(entries) if self.split == "train" else []
+
+        sorted_entries = sorted(entries, key=lambda e: e.tide)
+        n_val = max(1, int(round(len(sorted_entries) * self.val_ratio)))
+        n_val = min(n_val, len(sorted_entries) - 1)
+
+        if n_val == 0:
+            n_val = 1
+
+        # Choose a few tide levels spread across the full range so both train and val
+        # cover the tide spectrum instead of all the low/high values being in one split.
+        val_positions = np.unique(np.linspace(0, len(sorted_entries) - 1, num=n_val, dtype=int))
+        val_set = set(int(p) for p in val_positions)
+
+        selected = [
+            sorted_entries[i]
+            for i in range(len(sorted_entries))
+            if (i in val_set) == (self.split == "val")
+        ]
+
+        if not selected:
+            raise ValueError(
+                f"[{site}] El split {self.split} produjo un conjunto vacío con {len(entries)} imágenes. "
+                f"Considera aumentar el número de imágenes o ajustar val_ratio."
+            )
+
+        return selected
+
     def __len__(self):
-        return 10000
+        return 1000
 
     def _color_jitter_pair(self, ref: np.ndarray, target: np.ndarray):
         """Aplica el mismo aumento fotométrico a las dos imágenes del par."""
