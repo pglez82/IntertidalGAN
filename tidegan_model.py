@@ -27,7 +27,7 @@ class ConditionEmbed(nn.Module):
     Embeds a scalar tide level + site one-hot into a channel vector.
     The vector is later broadcast to spatial maps for injection into G and D.
     """
-    def __init__(self, n_sites=3, cond_dim=16):
+    def __init__(self, n_sites=3, cond_dim=32):
         super().__init__()
         self.cond_dim = cond_dim
         self.mlp = nn.Sequential(
@@ -142,7 +142,7 @@ class Generator(nn.Module):
         16×16 → 32×32 → 64×64 → 128×128 → 256×256
     """
 
-    def __init__(self, n_sites=3, cond_dim=16):
+    def __init__(self, n_sites=3, cond_dim=32):
         super().__init__()
         self.condition_embed = ConditionEmbed(n_sites, cond_dim)
 
@@ -334,7 +334,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     n_sites = 3
-    cond_dim = 16
+    cond_dim = 32
     patch_size = 256
     batch_size = 2
 

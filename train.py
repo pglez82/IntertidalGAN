@@ -50,12 +50,14 @@ def get_config(args):
         "n_sites": len(SITES),
         "cond_dim": 16,
         "beta1": 0.5,
-        "beta2": 0.999,
-        "gradient_penalty": 10.0,
-        "l1_weight": 100.0,
-        "log_interval": 50,
-        "save_interval": 5,
-        "eval_interval": 1,
+        "beta2": 0.9,
+        "gradient_penalty": 0.0,
+        "l1_weight": 5.0,
+        "gan_weight": 0.1,
+        "pretrain_epochs": args.pretrain_epochs,
+        "log_interval": 25,
+        "save_interval": 10,
+        "eval_interval": 2,
         "num_workers": args.num_workers,
         "seed": args.seed,
     }
@@ -99,6 +101,36 @@ def resolve_devices(args):
     primary = torch.device(f"cuda:{selected[0]}")
     return primary, selected
 
+
+@torch.no_grad()
+def save_generated_samples(G, val_loader, save_dir, epoch, device):
+    G.eval()
+    os.makedirs(save_dir, exist_ok=True)
+
+    for i, batch in enumerate(val_loader):
+        ref, target, condition = batch
+        ref = ref.to(device)
+        target = target.to(device)
+        condition = condition.to(device)
+
+        fake = G(ref, condition)
+
+        for j in range(min(3, ref.size(0))):
+            ref_img = ((ref[j].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
+            fake_img = ((fake[j].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
+            tgt_img = ((target[j].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
+
+            ref_pil = Image.fromarray((ref_img * 255).astype(np.uint8))
+            fake_pil = Image.fromarray((fake_img * 255).astype(np.uint8))
+            tgt_pil = Image.fromarray((tgt_img * 255).astype(np.uint8))
+
+            ref_pil.save(os.path.join(save_dir, f"epoch_{epoch}_ref_{j}.png"))
+            fake_pil.save(os.path.join(save_dir, f"epoch_{epoch}_fake_{j}.png"))
+            tgt_pil.save(os.path.join(save_dir, f"epoch_{epoch}_target_{j}.png"))
+
+        break
+
+    G.train()
 
 # ── Training functions ────────────────────────────────────────────────────
 def train_step_g(G, D, optimizer_g, criterion, config, batch, device):
@@ -377,55 +409,54 @@ def train(args):
             ref, target, condition = batch
             ref, target, condition = ref.to(device), target.to(device), condition.to(device)
 
-            # ── Update Generator ──────────────────────────────────────
-            fake = G(ref, condition)
-            disc_fake = D(ref, fake, condition)
-            # GAN loss for G: maximize D(fake) (hinge: -mean(D(fake)))
-            g_gan_loss = (-disc_fake).mean()
-            g_l1_loss = nn.L1Loss()(fake, target)
-            g_loss = g_gan_loss + config["l1_weight"] * g_l1_loss
+            if epoch < config["pretrain_epochs"]:
+                optimizer_g.zero_grad()
+                fake = G(ref, condition)
+                g_l1_loss = nn.L1Loss()(fake, target)
+                g_l1_loss.backward()
+                torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=5.0)
+                optimizer_g.step()
+                g_loss = float(g_l1_loss.item())
+                d_loss = 0.0
+                gp = 0.0
+                g_gan_loss = 0.0
+                d_gan_loss = 0.0
+            else:
+                # ── Update Generator ──────────────────────────────────────
+                optimizer_g.zero_grad()
+                fake = G(ref, condition)
+                disc_fake = D(ref, fake, condition)
+                g_gan_loss = F.binary_cross_entropy_with_logits(disc_fake, torch.ones_like(disc_fake))
+                g_l1_loss = nn.L1Loss()(fake, target)
+                g_loss = config["gan_weight"] * g_gan_loss + config["l1_weight"] * g_l1_loss
+                g_loss.backward()
+                torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=5.0)
+                optimizer_g.step()
 
-            optimizer_g.zero_grad()
-            g_loss.backward()
-            optimizer_g.step()
-
-            # ── Update Discriminator ──────────────────────────────────
-            disc_real = D(ref, target, condition)
-            with torch.no_grad():
+                # ── Update Discriminator ──────────────────────────────────
+                optimizer_d.zero_grad()
+                disc_real = D(ref, target, condition)
                 disc_fake = D(ref, fake.detach(), condition)
-            d_gan_loss, _ = criterion(disc_real, disc_fake)
+                d_real = F.binary_cross_entropy_with_logits(disc_real, torch.ones_like(disc_real))
+                d_fake = F.binary_cross_entropy_with_logits(disc_fake, torch.zeros_like(disc_fake))
+                d_loss = (d_real + d_fake) / 2.0
+                d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=5.0)
+                optimizer_d.step()
 
-            # Gradient penalty
-            alpha = torch.rand(ref.size(0), 1, 1, 1, device=device)
-            interpolates = alpha * target + (1 - alpha) * fake.detach()
-            interpolates.requires_grad_(True)
-            disc_interp = D(ref, interpolates, condition)
-            gradients = torch.autograd.grad(
-                outputs=disc_interp.sum(),
-                inputs=interpolates,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True,
-            )[0]
-            grad_norm = gradients.norm(2, dim=1)
-            gp = config["gradient_penalty"] * ((grad_norm - 1.0) ** 2).mean()
-
-            d_loss = d_gan_loss + gp
-
-            optimizer_d.zero_grad()
-            d_loss.backward()
-            optimizer_d.step()
+                gp = 0.0
+                d_gan_loss = float(d_loss.item())
 
             # Logging
-            running_d_loss += d_loss.item()
-            running_g_loss += g_loss.item()
+            running_d_loss += float(d_loss)
+            running_g_loss += float(g_loss)
             n_batches += 1
 
             if global_step % config["log_interval"] == 0:
-                writer.add_scalar("loss/g_gan", g_gan_loss.item(), global_step)
-                writer.add_scalar("loss/g_l1", g_l1_loss.item(), global_step)
-                writer.add_scalar("loss/d_gan", d_gan_loss.item(), global_step)
-                writer.add_scalar("loss/gp", gp.item(), global_step)
+                writer.add_scalar("loss/g_gan", float(g_gan_loss), global_step)
+                writer.add_scalar("loss/g_l1", float(g_l1_loss), global_step)
+                writer.add_scalar("loss/d_gan", float(d_gan_loss), global_step)
+                writer.add_scalar("loss/gp", float(gp), global_step)
                 writer.add_scalar("lr/g", optimizer_g.param_groups[0]["lr"], global_step)
                 writer.add_scalar("lr/d", optimizer_d.param_groups[0]["lr"], global_step)
 
@@ -456,6 +487,8 @@ def train(args):
             ckpt_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth")
             save_checkpoint(config, G, D, optimizer_g, optimizer_d,
                             epoch + 1, global_step, ckpt_path, data_rng)
+
+        save_generated_samples(G, val_loader, os.path.join(save_dir, "samples"), epoch, device)
 
     writer.close()
     print(f"\nTraining complete. Checkpoints in: {save_dir}")
@@ -523,9 +556,9 @@ def generate_images(args):
 def main():
     parser = argparse.ArgumentParser(description="TideGAN: Conditional GAN for tide-aware coastal image generation")
     parser.add_argument("--mode", choices=["train", "generate"], default="train")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr_g", type=float, default=2e-4)
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr_g", type=float, default=1e-4)
     parser.add_argument("--lr_d", type=float, default=2e-4)
     parser.add_argument("--patch_size", type=int, default=256)
     parser.add_argument("--site", nargs="+", default=None, help="Sites to use (e.g. Foz Santander Villaviciosa, default: all)")
@@ -533,6 +566,8 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--pretrain_epochs", type=int, default=15,
+                        help="Warm-up epochs with L1-only supervision before adversarial training starts")
     parser.add_argument("--devices", type=int, nargs="+", default=None,
                         help="CUDA device ids to use for training, e.g. --devices 0 1")
     parser.add_argument("--no_progress_bar", action="store_true")
