@@ -79,6 +79,27 @@ def _worker_init_fn(worker_id):
     np.random.seed(worker_seed)
 
 
+def resolve_devices(args):
+    """Return the primary CUDA device and list of visible GPU ids."""
+    if not torch.cuda.is_available():
+        return torch.device("cpu"), []
+
+    available = list(range(torch.cuda.device_count()))
+    if args.devices is None:
+        selected = available[: min(2, len(available))] if len(available) > 1 else available
+    else:
+        selected = [int(d) for d in args.devices]
+        invalid = [d for d in selected if d not in available]
+        if invalid:
+            raise ValueError(f"GPU ids invalidos: {invalid}. GPUs disponibles: {available}")
+
+    if len(selected) == 0:
+        return torch.device("cuda:0"), [0]
+
+    primary = torch.device(f"cuda:{selected[0]}")
+    return primary, selected
+
+
 # ── Training functions ────────────────────────────────────────────────────
 def train_step_g(G, D, optimizer_g, criterion, config, batch, device):
     """Single generator update step."""
@@ -191,12 +212,15 @@ def evaluate(G, D, config, data_loader, device, writer, global_step, prefix="eva
 def save_checkpoint(config, G, D, optimizer_g, optimizer_d, epoch, global_step, path,
                     data_rng=None):
     """Save training state."""
+    G_state = G.module.state_dict() if hasattr(G, "module") else G.state_dict()
+    D_state = D.module.state_dict() if hasattr(D, "module") else D.state_dict()
+
     torch.save({
         "config": config,
         "epoch": epoch,
         "global_step": global_step,
-        "generator_state": G.state_dict(),
-        "discriminator_state": D.state_dict(),
+        "generator_state": G_state,
+        "discriminator_state": D_state,
         "optimizer_g": optimizer_g.state_dict(),
         "optimizer_d": optimizer_d.state_dict(),
         "python_rng_state": random.getstate(),
@@ -212,9 +236,20 @@ def load_checkpoint(path, G, D=None, optimizer_g=None, optimizer_d=None, device=
                     data_rng=None):
     """Load training state."""
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    G.load_state_dict(checkpoint["generator_state"])
+
+    G_state = checkpoint["generator_state"]
+    if hasattr(G, "module"):
+        G.module.load_state_dict(G_state)
+    else:
+        G.load_state_dict(G_state)
+
     if D is not None:
-        D.load_state_dict(checkpoint["discriminator_state"])
+        D_state = checkpoint["discriminator_state"]
+        if hasattr(D, "module"):
+            D.module.load_state_dict(D_state)
+        else:
+            D.load_state_dict(D_state)
+
     if optimizer_g is not None and "optimizer_g" in checkpoint:
         optimizer_g.load_state_dict(checkpoint["optimizer_g"])
     if optimizer_d is not None and "optimizer_d" in checkpoint:
@@ -238,10 +273,15 @@ def train(args):
     if config["patch_size"] % 16:
         raise ValueError("--patch_size must be divisible by 16 for the U-Net skip shapes")
     seed_everything(config["seed"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, device_ids = resolve_devices(args)
     print(f"Device: {device}")
     if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Using CUDA devices: {device_ids}")
+        for i in device_ids:
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+
+    if len(device_ids) > 1:
+        print(f"Multi-GPU enabled with DataParallel across devices: {device_ids}")
 
     # ── Data ────────────────────────────────────────────────────────────
     print(f"\nLoading data (sites: {config['n_sites']})...")
@@ -287,6 +327,10 @@ def train(args):
     # ── Models ──────────────────────────────────────────────────────────
     G = Generator(n_sites=config["n_sites"], cond_dim=config["cond_dim"]).to(device)
     D = Discriminator(n_sites=config["n_sites"], cond_dim=config["cond_dim"]).to(device)
+
+    if len(device_ids) > 1:
+        G = nn.DataParallel(G, device_ids=device_ids)
+        D = nn.DataParallel(D, device_ids=device_ids)
 
     print(f"\nGenerator parameters: {count_parameters(G):,}")
     print(f"Discriminator parameters: {count_parameters(D):,}")
@@ -489,6 +533,8 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--devices", type=int, nargs="+", default=None,
+                        help="CUDA device ids to use for training, e.g. --devices 0 1")
     parser.add_argument("--no_progress_bar", action="store_true")
 
     # Generate mode args
