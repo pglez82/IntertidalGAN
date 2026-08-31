@@ -13,7 +13,7 @@ from PIL import Image
 
 # ── Site metadata ──────────────────────────────────────────────────────────
 SITES = ["Foz", "Santander", "Villaviciosa"]
-SITE_DIR = "data"
+SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 SITE_TIDE_RANGES = {
     "Foz": (-1.896, 1.186),
@@ -23,7 +23,7 @@ SITE_TIDE_RANGES = {
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 def _read_csv(path):
-    with open(path, "r") as f:
+    with open(path, "r", newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 def _load_image(path):
@@ -89,6 +89,11 @@ class TideImageEntry:
         """Carga las imágenes en memoria y procesa la máscara SCL."""
         self.rgb_data = _load_image(self.rgb_path)
         self.scl_data = _load_scl(self.scl_path)
+        if self.rgb_data.shape[:2] != self.scl_data.shape:
+            raise ValueError(
+                f"RGB y SCL tienen tamaños distintos para {self.rgb_path}: "
+                f"{self.rgb_data.shape[:2]} != {self.scl_data.shape}"
+            )
 
 # ── Dataset ────────────────────────────────────────────────────────────────
 class TideGANDataset(Dataset):
@@ -120,6 +125,9 @@ class TideGANDataset(Dataset):
             self.entries_by_site[site] = entries
             all_tides.extend([e.tide for e in entries])
 
+        if not all_tides:
+            raise ValueError("No se encontraron imágenes con datos de marea.")
+
         # 2. Normalización global de mareas
         self.global_min_tide = min(all_tides)
         self.global_max_tide = max(all_tides)
@@ -129,7 +137,9 @@ class TideGANDataset(Dataset):
         print("Cargando todas las imágenes y máscaras en memoria RAM. Esto puede tardar un minuto...")
         for site, entries in self.entries_by_site.items():
             for entry in entries:
-                entry.norm_tide = 2.0 * (entry.tide - self.global_min_tide) / (self.global_max_tide - self.global_min_tide) - 1.0
+                # The model and inference normalize within each site's tide
+                # range; training must use the same convention.
+                entry.norm_tide = _normalize_tide(entry.tide, site)
                 entry.load_into_ram()
         print("Carga en memoria completada. ¡Listo para entrenar a máxima velocidad!")
 
@@ -141,7 +151,7 @@ class TideGANDataset(Dataset):
                 scl = entry.scl_data
                 cloud_ratio = np.mean(np.isin(scl, self.cloud_classes))
                 
-                if cloud_ratio <= 0.01:
+                if cloud_ratio <= self.max_cloud_pct:
                     best_ref = entry
                     print(f"[{site}] Referencia fija: {entry.date} (Marea: {entry.tide}m, Nubes: {cloud_ratio:.1%})")
                     break
@@ -157,22 +167,24 @@ class TideGANDataset(Dataset):
     def __len__(self):
         return 100000
 
-    def _color_jitter(self, img: np.ndarray) -> np.ndarray:
-        """Aumentos de color independientes para cada imagen."""
+    def _color_jitter_pair(self, ref: np.ndarray, target: np.ndarray):
+        """Aplica el mismo aumento fotométrico a las dos imágenes del par."""
         if random.random() > 0.5:
             factor = random.uniform(0.85, 1.15)
-            img = img * factor
+            ref = ref * factor
+            target = target * factor
         if random.random() > 0.5:
             offset = random.uniform(-10, 10)
-            img = np.clip(img + offset, 0, 255)
-        return img
+            ref = np.clip(ref + offset, 0, 255)
+            target = np.clip(target + offset, 0, 255)
+        return ref, target
 
     def _get_valid_crop_coords(self, ref_scl: np.ndarray, target_scl: np.ndarray, max_retries=50):
         """
         Returns: (y, x, success_boolean, min_bad_ratio)
         """
         H, W = target_scl.shape
-        if H <= self.patch_size or W <= self.patch_size:
+        if H < self.patch_size or W < self.patch_size:
             return 0, 0, False, float('inf')
 
         best_y, best_x = 0, 0
@@ -239,7 +251,6 @@ class TideGANDataset(Dataset):
         return one_hot
 
     def __getitem__(self, idx):
-        # Bucle estricto de 10 intentos
         for _ in range(10):
             site = random.choice(self.sites_list)
             entries = self.entries_by_site[site]
@@ -248,12 +259,15 @@ class TideGANDataset(Dataset):
             ref_entry = self.ref_image_by_site[site]
             ref_scl = ref_entry.scl_data
 
-            # 2. Seleccionar target
-            for _ in range(20):
-                target_entry = random.choice(entries)
-                if abs(target_entry.norm_tide - ref_entry.norm_tide) > self.min_tide_diff:
-                    break
-                    
+            # Select from valid tide-separated targets instead of silently
+            # using the last random candidate when no candidate was found.
+            candidates = [
+                entry for entry in entries
+                if abs(entry.norm_tide - ref_entry.norm_tide) > self.min_tide_diff
+            ]
+            if not candidates:
+                continue
+            target_entry = random.choice(candidates)
             target_scl = target_entry.scl_data
 
             # 3. Buscar parche válido (es ultra rápido porque solo recorta matrices en RAM)
@@ -274,16 +288,17 @@ class TideGANDataset(Dataset):
                     target_patch = np.ascontiguousarray(target_patch[:, ::-1, :])
 
                 if self.augment:
-                    ref_patch = self._color_jitter(ref_patch)
-                    target_patch = self._color_jitter(target_patch)
+                    ref_patch, target_patch = self._color_jitter_pair(ref_patch, target_patch)
 
                 # A tensores
                 ref_tensor = self._to_tensor(ref_patch)
                 target_tensor = self._to_tensor(target_patch)
                 tide = torch.tensor([target_entry.norm_tide], dtype=torch.float32)
+                condition = torch.cat([tide, self._site_one_hot(site, len(SITES))])
 
-                return ref_tensor, target_tensor, tide
+                return ref_tensor, target_tensor, condition
 
-        # Fallback seguro mediante recursión si fallan los 10 intentos
-        new_idx = random.randint(0, len(self) - 1)
-        return self.__getitem__(new_idx)
+        raise RuntimeError(
+            "No se pudo extraer un parche válido tras varios intentos. "
+            "Revisa max_cloud_pct, max_nodata_pct y patch_size."
+        )
