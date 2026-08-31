@@ -233,7 +233,9 @@ class Discriminator(nn.Module):
         super().__init__()
         self.condition_embed = ConditionEmbed(n_sites, cond_dim)
 
-        n_channels = 3 + 3  # ref + target (or gen)
+        # Keep the condition in the discriminator input: computing an embedding
+        # without using it makes D unconditional and lets it ignore tide/site.
+        n_channels = 3 + 3 + cond_dim  # ref + target (or gen) + condition maps
         self.model = nn.Sequential(
             nn.Conv2d(n_channels, 64, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -272,6 +274,10 @@ class Discriminator(nn.Module):
 
         # Concatenate ref + generated along channel dimension
         x = torch.cat([ref_image, generated_image], dim=1)
+        cond_maps = cond_embed[:, :, None, None].expand(
+            -1, -1, x.shape[2], x.shape[3]
+        )
+        x = torch.cat([x, cond_maps], dim=1)
 
         # Forward through CNN
         out = self.model(x)
@@ -299,13 +305,17 @@ class GANLoss(nn.Module):
             d_loss, g_loss
         """
         if self.mode == "hinge":
-            d_loss = (F.relu(1 - disc_real) + F.relu(1 + disc_fake)).mean()
+            # Generator-only updates have no real discriminator output.
+            d_loss = None if disc_real is None else (
+                F.relu(1 - disc_real) + F.relu(1 + disc_fake)
+            ).mean()
             g_loss = (-disc_fake).mean()
         elif self.mode == "vanilla":
-            d_loss = (F.binary_cross_entropy_with_logits(
-                disc_real, torch.ones_like(disc_real)) +
+            d_loss = None if disc_real is None else (
                 F.binary_cross_entropy_with_logits(
-                disc_fake, torch.zeros_like(disc_fake))) / 2
+                    disc_real, torch.ones_like(disc_real)) +
+                F.binary_cross_entropy_with_logits(
+                    disc_fake, torch.zeros_like(disc_fake))) / 2
             g_loss = F.binary_cross_entropy_with_logits(
                 disc_fake, torch.ones_like(disc_fake))
         else:
