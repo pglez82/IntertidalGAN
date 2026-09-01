@@ -1,19 +1,13 @@
 """
-TideGAN: Conditional GAN for tide-aware coastal image generation.
+TideGAN: Conditional image-to-image translation for tide-aware coastal imagery.
 
 Architecture:
-  Generator: U-Net with skip connections
-    - Input: reference image (3 ch) + condition vector (concatenated on channel dim
-      via spatially broadcast condition maps)
+  Generator: U-Net with AdaIN condition injection
+    - Input: reference image (3 ch) + condition vector (broadcast as spatial maps)
     - Output: synthetic image (3 ch)
 
-  Discriminator: PatchGAN (FCN) discriminator
-    - Input: concatenated [reference, generated/target] + condition maps
-    - Output: per-patch realism scores (70×70 patches)
-
 The condition (normalized tide level + site embedding) is injected via
-AdaIN-style feature modulation in the generator and concatenated as
-spatially-expanded condition maps for both G and D.
+AdaIN-style feature modulation at every normalization layer in the generator.
 """
 
 import torch
@@ -24,8 +18,8 @@ import torch.nn.functional as F
 # ── Conditional injection helpers ──────────────────────────────────────────
 class ConditionEmbed(nn.Module):
     """
-    Embeds a scalar tide level + site one-hot into a channel vector.
-    The vector is later broadcast to spatial maps for injection into G and D.
+    Embeds a scalar tide level + site one-hot into a channel vector,
+    broadcast to spatial maps for injection into the generator.
     """
     def __init__(self, n_sites=3, cond_dim=32):
         super().__init__()
@@ -62,7 +56,7 @@ class AdaIN(nn.Module):
         return stats * (1 + scale) + shift
 
 
-# ── Generator: U-Net with AdaIN condition injection ───────────────────────
+# ── Generator blocks ─────────────────────────────────────────────────────
 class CondEncoder(nn.Module):
     """Downsampling block: Conv→AdaIN→LeakyReLU."""
     def __init__(self, in_ch, out_ch, cond_dim=16):
@@ -218,111 +212,6 @@ class Generator(nn.Module):
         return out
 
 
-# ── Discriminator: PatchGAN (FCN) with condition injection ─────────────────
-class Discriminator(nn.Module):
-    """
-    PatchGAN (fully convolutional) discriminator.
-
-    Output is a (B, 1, H/2^k, W/2^k) map of patch realism scores.
-    For 256×256 input → (B, 1, 8, 8) with kernel_size=4, stride=2, 5 conv blocks.
-
-    Condition is injected via learned condition maps concatenated to features.
-    """
-
-    def __init__(self, n_sites=3, cond_dim=16):
-        super().__init__()
-        self.condition_embed = ConditionEmbed(n_sites, cond_dim)
-
-        # Keep the condition in the discriminator input: computing an embedding
-        # without using it makes D unconditional and lets it ignore tide/site.
-        n_channels = 3 + 3 + cond_dim  # ref + target (or gen) + condition maps
-        self.model = nn.Sequential(
-            nn.Conv2d(n_channels, 64, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 128×128
-
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 64×64
-
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 32×32
-
-            nn.Conv2d(256, 512, kernel_size=4, stride=1, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 32×32
-
-            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=1),
-            # 32×32 output map
-        )
-        # Final logit layer is just the last conv above
-
-    def forward(self, ref_image, generated_image, condition):
-        """
-        Args:
-            ref_image:        (B, 3, H, W)
-            generated_image:  (B, 3, H, W)
-            condition:        (B, 1 + n_sites)
-        Returns:
-            logits:  (B, 1, H/32, W/32)  realness scores per patch
-        """
-        cond_embed = self.condition_embed(condition)
-
-        # Concatenate ref + generated along channel dimension
-        x = torch.cat([ref_image, generated_image], dim=1)
-        cond_maps = cond_embed[:, :, None, None].expand(
-            -1, -1, x.shape[2], x.shape[3]
-        )
-        x = torch.cat([x, cond_maps], dim=1)
-
-        # Forward through CNN
-        out = self.model(x)
-        return out
-
-
-# ── Loss functions ─────────────────────────────────────────────────────────
-class GANLoss(nn.Module):
-    """
-    Hinge loss for both G and D. Stable and produces high-quality results.
-
-    D loss:  max(0, 1 - D(real)) + max(0, 1 + D(fake))
-    G loss:  -D(fake)
-    """
-    def __init__(self, mode="hinge"):
-        super().__init__()
-        self.mode = mode
-
-    def forward(self, disc_real, disc_fake):
-        """
-        Args:
-            disc_real:  (B, ...)  discriminator output on real images
-            disc_fake:  (B, ...)  discriminator output on generated images
-        Returns:
-            d_loss, g_loss
-        """
-        if self.mode == "hinge":
-            # Generator-only updates have no real discriminator output.
-            d_loss = None if disc_real is None else (
-                F.relu(1 - disc_real) + F.relu(1 + disc_fake)
-            ).mean()
-            g_loss = (-disc_fake).mean()
-        elif self.mode == "vanilla":
-            d_loss = None if disc_real is None else (
-                F.binary_cross_entropy_with_logits(
-                    disc_real, torch.ones_like(disc_real)) +
-                F.binary_cross_entropy_with_logits(
-                    disc_fake, torch.zeros_like(disc_fake))) / 2
-            g_loss = F.binary_cross_entropy_with_logits(
-                disc_fake, torch.ones_like(disc_fake))
-        else:
-            raise ValueError(f"Unknown GAN loss mode: {self.mode}")
-        return d_loss, g_loss
-
-
 # ── Utility: count parameters ─────────────────────────────────────────────
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -348,17 +237,4 @@ if __name__ == "__main__":
         gen = G(ref, cond)
     print(f"Generator output: {gen.shape}  (range: {gen.min():.3f}, {gen.max():.3f})")
 
-    # Test Discriminator
-    D = Discriminator(n_sites, cond_dim).to(device)
-    print(f"Discriminator parameters: {count_parameters(D):,}")
 
-    with torch.no_grad():
-        disc_real = D(ref, ref, cond)
-        disc_fake = D(ref, gen, cond)
-    print(f"Disc real output: {disc_real.shape}")
-    print(f"Disc fake output: {disc_fake.shape}")
-
-    # Test GAN loss
-    loss_fn = GANLoss("hinge")
-    d_loss, g_loss = loss_fn(disc_real, disc_fake)
-    print(f"\nD loss: {d_loss:.4f}, G loss: {g_loss:.4f}")

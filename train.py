@@ -51,7 +51,6 @@ def get_config(args):
         "cond_dim": 16,
         "beta1": 0.5,
         "beta2": 0.9,
-        "l1_weight": 5.0,
         "log_interval": 25,
         "save_interval": 10,
         "eval_interval": 2,
@@ -341,8 +340,7 @@ def train(args):
 
             optimizer_g.zero_grad()
             fake = G(ref, condition)
-            g_l1_loss = nn.L1Loss()(fake, target)
-            g_loss = config["l1_weight"] * g_l1_loss
+            g_loss = nn.L1Loss()(fake, target)
             g_loss.backward()
             torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=5.0)
             optimizer_g.step()
@@ -351,7 +349,7 @@ def train(args):
             n_batches += 1
 
             if global_step % config["log_interval"] == 0:
-                writer.add_scalar("loss/g_l1", float(g_l1_loss.item()), global_step)
+                writer.add_scalar("loss/l1", g_loss.item(), global_step)
                 writer.add_scalar("lr/g", optimizer_g.param_groups[0]["lr"], global_step)
 
             global_step += 1
@@ -365,7 +363,7 @@ def train(args):
 
         print(f"\nEpoch {epoch+1}/{config['epochs']}  "
               f"G={avg_g:.4f}  "
-              f"L1={g_l1_loss.item():.4f}  "
+              f"L1={g_loss.item():.4f}  "
               f"lr={current_lr:.2e}  "
               f"Time: {epoch_time:.1f}s")
 
