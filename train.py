@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 from tidegan_dataset import TideGANDataset, SITES, SITE_TIDE_RANGES, SITE_DIR
 from tidegan_model import Generator, count_parameters
-from PIL import Image
+from PIL import Image, ImageDraw
 import random
 
 
@@ -113,6 +113,12 @@ def save_generated_samples(G, val_loader, save_dir, epoch, device):
         fake = G(ref, condition)
         sample_idx = 0
 
+        norm_tide = float(condition[sample_idx, 0].item())
+        site_idx = int(condition[sample_idx, 1:].argmax().item())
+        site_name = SITES[site_idx]
+        tmin, tmax = SITE_TIDE_RANGES[site_name]
+        tide_m = ((norm_tide + 1.0) / 2.0) * (tmax - tmin) + tmin
+
         ref_img = ((ref[sample_idx].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
         fake_img = ((fake[sample_idx].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
         tgt_img = ((target[sample_idx].cpu().permute(1, 2, 0).clamp(-1, 1) + 1) / 2).numpy()
@@ -121,14 +127,27 @@ def save_generated_samples(G, val_loader, save_dir, epoch, device):
         panel_fake = Image.fromarray((fake_img * 255).astype(np.uint8))
         panel_target = Image.fromarray((tgt_img * 255).astype(np.uint8))
 
+        for panel, label in [(panel_ref, "Reference"), (panel_fake, "Generated"), (panel_target, "Target")]:
+            draw = ImageDraw.Draw(panel)
+            draw.rectangle((0, 0, panel.width - 1, 24), fill=(0, 0, 0, 180))
+            draw.text((10, 6), label, fill=(255, 255, 255))
+
+        montage_h = panel_ref.height + 42
         montage = Image.new(
             "RGB",
-            (panel_ref.width * 3, panel_ref.height),
-            color=(255, 255, 255),
+            (panel_ref.width * 3, montage_h),
+            color=(30, 30, 30),
         )
-        montage.paste(panel_ref, (0, 0))
-        montage.paste(panel_fake, (panel_ref.width, 0))
-        montage.paste(panel_target, (panel_ref.width * 2, 0))
+        draw = ImageDraw.Draw(montage)
+        draw.text(
+            (20, 10),
+            f"Target tide: {tide_m:.3f} m  |  site: {site_name}",
+            fill=(255, 255, 255),
+        )
+
+        montage.paste(panel_ref, (0, 42))
+        montage.paste(panel_fake, (panel_ref.width, 42))
+        montage.paste(panel_target, (panel_ref.width * 2, 42))
         montage.save(os.path.join(save_dir, f"epoch_{epoch}_comparison.png"))
         break
 
@@ -171,7 +190,7 @@ def evaluate(G, data_loader, device, writer, global_step, prefix="eval"):
 
 
 # ── Save / Load ───────────────────────────────────────────────────────────
-def save_checkpoint(config, G, optimizer_g, epoch, global_step, path, data_rng=None):
+def save_checkpoint(config, G, optimizer_g, scheduler_g, epoch, global_step, path, data_rng=None):
     """Save generator-only training state."""
     G_state = G.module.state_dict() if hasattr(G, "module") else G.state_dict()
 
@@ -181,6 +200,7 @@ def save_checkpoint(config, G, optimizer_g, epoch, global_step, path, data_rng=N
         "global_step": global_step,
         "generator_state": G_state,
         "optimizer_g": optimizer_g.state_dict(),
+        "scheduler_g": scheduler_g.state_dict(),
         "python_rng_state": random.getstate(),
         "numpy_rng_state": np.random.get_state(),
         "torch_rng_state": torch.get_rng_state(),
@@ -190,7 +210,7 @@ def save_checkpoint(config, G, optimizer_g, epoch, global_step, path, data_rng=N
     print(f"  ✓ Checkpoint saved: {path}")
 
 
-def load_checkpoint(path, G, optimizer_g=None, device="cpu", data_rng=None):
+def load_checkpoint(path, G, optimizer_g=None, scheduler_g=None, device="cpu", data_rng=None):
     """Load generator-only training state."""
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
@@ -202,6 +222,8 @@ def load_checkpoint(path, G, optimizer_g=None, device="cpu", data_rng=None):
 
     if optimizer_g is not None and "optimizer_g" in checkpoint:
         optimizer_g.load_state_dict(checkpoint["optimizer_g"])
+    if scheduler_g is not None and "scheduler_g" in checkpoint:
+        scheduler_g.load_state_dict(checkpoint["scheduler_g"])
     if "python_rng_state" in checkpoint:
         random.setstate(checkpoint["python_rng_state"])
         np.random.set_state(checkpoint["numpy_rng_state"])
@@ -279,9 +301,13 @@ def train(args):
 
     print(f"\nGenerator parameters: {count_parameters(G):,}")
 
-    # ── Optimizer ──────────────────────────────────────────────────────
+    # ── Optimizer & scheduler ───────────────────────────────────────────
     optimizer_g = optim.Adam(G.parameters(), lr=config["lr_g"],
                              betas=(config["beta1"], config["beta2"]))
+    scheduler_g = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_g,
+        T_max=max(1, config["epochs"]),
+    )
 
     # ── Logging ─────────────────────────────────────────────────────────
     save_dir = args.save_dir
@@ -293,7 +319,7 @@ def train(args):
 
     if args.resume:
         start_epoch, global_step = load_checkpoint(
-            args.resume, G, optimizer_g, device, data_rng)
+            args.resume, G, optimizer_g, scheduler_g, device, data_rng)
 
     # ── Training ────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -332,12 +358,15 @@ def train(args):
 
         avg_g = running_g_loss / n_batches
         epoch_time = time.time() - epoch_start
+        current_lr = optimizer_g.param_groups[0]["lr"]
 
         writer.add_scalar("metrics/g_loss", avg_g, epoch)
+        writer.add_scalar("lr/g", current_lr, epoch)
 
         print(f"\nEpoch {epoch+1}/{config['epochs']}  "
               f"G={avg_g:.4f}  "
               f"L1={g_l1_loss.item():.4f}  "
+              f"lr={current_lr:.2e}  "
               f"Time: {epoch_time:.1f}s")
 
         if (epoch + 1) % config["eval_interval"] == 0 or epoch == 0:
@@ -347,9 +376,11 @@ def train(args):
 
         if (epoch + 1) % config["save_interval"] == 0 or epoch == 0:
             ckpt_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth")
-            save_checkpoint(config, G, optimizer_g, epoch + 1, global_step, ckpt_path, data_rng)
+            save_checkpoint(config, G, optimizer_g, scheduler_g, epoch + 1, global_step, ckpt_path, data_rng)
 
         save_generated_samples(G, val_loader, os.path.join(save_dir, "samples"), epoch, device)
+
+        scheduler_g.step()
 
     writer.close()
     print(f"\nTraining complete. Checkpoints in: {save_dir}")
