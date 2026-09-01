@@ -3,3 +3,4 @@ checkpoints
 __pycache__
 *.png
 .ipynb_checkpoints
+*_tide_images

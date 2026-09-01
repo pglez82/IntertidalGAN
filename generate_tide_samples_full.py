@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from matplotlib.gridspec import GridSpec
 import matplotlib.pyplot as plt
+import cv2
 
 from tidegan_dataset import TideGANDataset, SITES, SITE_TIDE_RANGES, _normalize_tide
 from tidegan_model import Generator
@@ -246,8 +247,28 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         montage_path = os.path.join(out_dir, "montage.png")
         plt.savefig(montage_path, dpi=150, bbox_inches="tight")
+
+        print("Generating video from tide frames...")
+        # ── Save video from tide frames ───────────────────────────────────
+        video_path = os.path.join(out_dir, "tide_evolution.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = 5  # frames per second
+        video_writer = cv2.VideoWriter(video_path, fourcc, fps, (W, H))
+
+        for img, tide in generated_full:
+            img_display = np.clip(img * 127.5 + 127.5, 0, 255).astype(np.uint8)
+            # Convert RGB (from numpy) to BGR for OpenCV
+            img_bgr = cv2.cvtColor(img_display, cv2.COLOR_RGB2BGR)
+            # Add tide level text overlay
+            text = f"{tide:+.2f}m"
+            cv2.putText(img_bgr, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (255, 255, 255), 2, cv2.LINE_AA)
+            video_writer.write(img_bgr)
+
+        video_writer.release()
         print(f"  ✓ Saved {len(generated_full)} images at full resolution ({H}x{W}px)")
         print(f"  ✓ Saved montage to {montage_path}")
+        print(f"  ✓ Saved video to {video_path} ({fps} fps)")
 
     print("Done!")
 
