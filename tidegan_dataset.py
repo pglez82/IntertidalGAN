@@ -297,7 +297,18 @@ class TideGANDataset(Dataset):
         return one_hot
 
     def __getitem__(self, idx):
-        for _ in range(10):
+        import warnings
+        warn_every = 100
+        attempt = 0
+        while True:
+            attempt += 1
+            if attempt % warn_every == 0:
+                warnings.warn(
+                    f"TideGAN: Still searching for a valid patch (attempt {attempt}). "
+                    f"If this takes a long time, your patches may be too large or "
+                    f"your images have few valid regions. Consider adjusting "
+                    f"max_cloud_pct / max_nodata_pct / patch_size."
+                )
             site = random.choice(self.sites_list)
             entries = self.entries_by_site[site]
 
@@ -344,7 +355,4 @@ class TideGANDataset(Dataset):
 
                 return ref_tensor, target_tensor, condition
 
-        raise RuntimeError(
-            "No se pudo extraer un parche válido tras varios intentos. "
-            "Revisa max_cloud_pct, max_nodata_pct y patch_size."
-        )
+
